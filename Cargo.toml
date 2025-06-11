@@ -1,0 +1,24 @@
+[package]
+name = "forced-inclusion-sender"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.35", features = ["derive", "env"] }
+tokio = { version = "1.40.0", features = ["full"] }
+alloy = { version = "1.0.9", features = [
+    "consensus",
+    "json",
+    "rpc-types",
+    "rpc-types-beacon",
+    "reqwest",
+    "kzg",
+    "arbitrary",
+    "provider-ws",
+] }
+alloy-rlp = "0.3.12"
+dotenvy = "0.15.7"
+eyre = "0.6.12"
+flate2 = "1.1"
+thiserror = "2.0"
+ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus", rev = "ade5ce6" } # Last release in 2022
