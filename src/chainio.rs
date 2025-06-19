@@ -7,6 +7,9 @@ sol! {
         uint8 public immutable inclusionDelay;
         uint64 public immutable feeInGwei;
 
+        uint64 public head;
+        uint64 public tail;
+
         struct ForcedInclusion {
             bytes32 blobHash;
             uint64 feeInGwei;

@@ -19,6 +19,9 @@ mod chainio;
 /// CLI for the forced inclusion tx sender tool.
 #[derive(Debug, Parser)]
 struct Cli {
+    #[clap(subcommand)]
+    command: Cmd,
+
     /// RPC URL of the L1 execution layer network.
     #[clap(long, env)]
     l1_rpc_url: Url,
@@ -36,69 +39,112 @@ struct Cli {
     forced_inclusion_store_address: Address,
 }
 
+/// Command to execute.
+#[derive(Debug, Default, Parser)]
+enum Cmd {
+    /// Send a forced inclusion transaction.
+    #[default]
+    Send,
+    /// Read the forced inclusion queue from the contract.
+    ReadQueue,
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
 
-    let l1_provider = ProviderBuilder::new()
-        .wallet(cli.l1_private_key)
-        .connect_http(cli.l1_rpc_url);
-    let l2_provider = ProviderBuilder::new()
-        .wallet(cli.l2_private_key)
-        .connect_http(cli.l2_rpc_url);
+    match cli.command {
+        Cmd::Send => cli.send().await,
+        Cmd::ReadQueue => cli.read_queue().await,
+    }
+}
 
-    let store = IForcedInclusionStore::new(cli.forced_inclusion_store_address, l1_provider);
+impl Cli {
+    async fn send(self) -> eyre::Result<()> {
+        let l1_provider = ProviderBuilder::new()
+            .wallet(self.l1_private_key)
+            .connect_http(self.l1_rpc_url);
+        let l2_provider = ProviderBuilder::new()
+            .wallet(self.l2_private_key)
+            .connect_http(self.l2_rpc_url);
 
-    // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
-    let l2_tx_req = TransactionRequest::default()
-        .to(Address::ZERO)
-        .value(U256::from(1_000_000_000));
-    let l2_tx = l2_provider.fill(l2_tx_req).await?.try_into_envelope()?;
+        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
 
-    // Prepare the sidecar for the forced inclusion
-    let compressed_batch = rlp_encode_and_compress(&vec![l2_tx])?;
-    let byte_size = compressed_batch.len() as u32;
-    let sidecar = blob::create_blob_sidecar_from_data_async(compressed_batch).await?;
+        // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
+        let l2_tx_req = TransactionRequest::default()
+            .to(Address::ZERO)
+            .value(U256::from(1_000_000_000));
+        let l2_tx = l2_provider.fill(l2_tx_req).await?.try_into_envelope()?;
 
-    // Get the required fee for the forced inclusion
-    let fee_wei = U256::from(store.feeInGwei().call().await? * GWEI_TO_WEI);
+        // Prepare the sidecar for the forced inclusion
+        let compressed_batch = rlp_encode_and_compress(&vec![l2_tx])?;
+        let byte_size = compressed_batch.len() as u32;
+        let sidecar = blob::create_blob_sidecar_from_data_async(compressed_batch).await?;
 
-    // Send the forced inclusion transaction on L1
-    match store
-        .storeForcedInclusion(0, 0, byte_size)
-        .sidecar(sidecar)
-        .value(fee_wei)
-        .send()
-        .await
-    {
-        Ok(tx) => {
-            let receipt = tx.get_receipt().await?;
-            if receipt.status() {
+        // Get the required fee for the forced inclusion
+        let fee_wei = U256::from(store.feeInGwei().call().await? * GWEI_TO_WEI);
+
+        // Send the forced inclusion transaction on L1
+        match store
+            .storeForcedInclusion(0, 0, byte_size)
+            .sidecar(sidecar)
+            .value(fee_wei)
+            .send()
+            .await
+        {
+            Ok(tx) => {
+                let receipt = tx.get_receipt().await?;
+                if receipt.status() {
+                    println!(
+                        "✅ Forced inclusion batch sent successfully! Hash: {}",
+                        receipt.transaction_hash
+                    );
+                } else {
+                    println!(
+                        "❌ Forced inclusion batch failed! Status: {}",
+                        receipt.transaction_hash
+                    );
+                }
+            }
+            Err(e) => {
+                let decoded_error = e
+                    .as_decoded_interface_error::<IForcedInclusionStoreErrors>()
+                    .ok_or(e)?;
                 println!(
-                    "✅ Forced inclusion batch sent successfully! Hash: {}",
-                    receipt.transaction_hash
-                );
-            } else {
-                println!(
-                    "❌ Forced inclusion batch failed! Status: {}",
-                    receipt.transaction_hash
+                    "❌ Forced inclusion batch failed! Error: {:?}",
+                    decoded_error
                 );
             }
         }
-        Err(e) => {
-            let decoded_error = e
-                .as_decoded_interface_error::<IForcedInclusionStoreErrors>()
-                .ok_or(e)?;
-            println!(
-                "❌ Forced inclusion batch failed! Error: {:?}",
-                decoded_error
-            );
-        }
+
+        Ok(())
     }
 
-    Ok(())
+    /// Read the forced inclusion queue from the contract.
+    async fn read_queue(self) -> eyre::Result<()> {
+        let l1_provider = ProviderBuilder::new()
+            .wallet(self.l1_private_key)
+            .connect_http(self.l1_rpc_url);
+        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
+
+        let tail = store.tail().call().await?;
+        let head = store.head().call().await?;
+        let size = tail.saturating_sub(head);
+
+        if size == 0 {
+            println!("Forced inclusion queue is empty");
+            return Ok(());
+        }
+
+        for i in 0..size {
+            let fi = store.getForcedInclusion(U256::from(i)).call().await?;
+            println!("Forced inclusion {}: {:?}\n", i, fi);
+        }
+
+        Ok(())
+    }
 }
 
 /// RLP-encode and compress with zlib a given encodable object.

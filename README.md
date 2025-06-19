@@ -10,6 +10,9 @@ git clone git@github.com:merklefruit/taiko-forced-inclusion-sender.git && cd tai
 cp .env.example .env
 vim .env
 
-# then start the script.
-cargo run
+# to send a forced included transaction:
+cargo run send
+
+# to read the current queue from the contract:
+cargo run read-queue
 ```
