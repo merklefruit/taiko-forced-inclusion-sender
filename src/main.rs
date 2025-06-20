@@ -138,9 +138,19 @@ impl Cli {
             return Ok(());
         }
 
-        for i in 0..size {
-            let fi = store.getForcedInclusion(U256::from(i)).call().await?;
-            println!("Forced inclusion {}: {:?}\n", i, fi);
+        for i in head..tail {
+            match store.getForcedInclusion(U256::from(i)).call().await {
+                Ok(fi) => println!("Forced inclusion {}: {:?}\n", i, fi),
+                Err(e) => {
+                    if let Some(dec) = e.as_decoded_interface_error::<IForcedInclusionStoreErrors>()
+                    {
+                        println!("Error reading forced inclusion {}: {:?}", i, dec);
+                        continue;
+                    } else {
+                        println!("Error reading forced inclusion {}: {:?}", i, e);
+                    }
+                }
+            }
         }
 
         Ok(())
