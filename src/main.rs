@@ -2,8 +2,9 @@ use std::io::Write;
 
 use alloy::{
     consensus::constants::GWEI_TO_WEI,
+    network::TransactionBuilder,
     primitives::{Address, Bytes, U256},
-    providers::ProviderBuilder,
+    providers::{Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
     transports::http::reqwest::Url,
@@ -40,13 +41,22 @@ struct Cli {
 }
 
 /// Command to execute.
-#[derive(Debug, Default, Parser)]
+#[derive(Debug, Parser)]
 enum Cmd {
     /// Send a forced inclusion transaction.
-    #[default]
-    Send,
+    Send(SendCmdOptions),
     /// Read the forced inclusion queue from the contract.
     ReadQueue,
+}
+
+#[derive(Debug, Clone, Copy, Parser)]
+struct SendCmdOptions {
+    /// The nonce delta to use for the forced inclusion transactions.
+    ///
+    /// This is useful to send multiple forced batches with valid transactions
+    /// from the same account.
+    #[clap(long)]
+    starting_nonce_delta: Option<u64>,
 }
 
 #[tokio::main]
@@ -56,27 +66,38 @@ async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Send => cli.send().await,
+        Cmd::Send(opts) => cli.send(opts).await,
         Cmd::ReadQueue => cli.read_queue().await,
     }
 }
 
 impl Cli {
-    async fn send(self) -> eyre::Result<()> {
+    async fn send(self, opts: SendCmdOptions) -> eyre::Result<()> {
         let l1_provider = ProviderBuilder::new()
             .wallet(self.l1_private_key)
             .connect_http(self.l1_rpc_url);
         let l2_provider = ProviderBuilder::new()
-            .wallet(self.l2_private_key)
+            .wallet(self.l2_private_key.clone())
             .connect_http(self.l2_rpc_url);
 
         let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
 
+        let sender = self.l2_private_key.address();
+        let current_nonce = l2_provider.get_transaction_count(sender).pending().await?;
+        let starting_nonce = if let Some(delta) = opts.starting_nonce_delta {
+            current_nonce + delta
+        } else {
+            current_nonce
+        };
+
         // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
         let l2_tx_req = TransactionRequest::default()
             .to(Address::ZERO)
-            .value(U256::from(1_000_000_000));
+            .with_nonce(starting_nonce)
+            .value(U256::from(GWEI_TO_WEI));
+
         let l2_tx = l2_provider.fill(l2_tx_req).await?.try_into_envelope()?;
+        println!("L2 transasction to be force-included: {:?}", l2_tx.hash());
 
         // Prepare the sidecar for the forced inclusion
         let compressed_batch = rlp_encode_and_compress(&vec![l2_tx])?;
