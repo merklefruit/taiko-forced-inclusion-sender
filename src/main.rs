@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, time::Duration};
 
 use alloy::{
     consensus::constants::GWEI_TO_WEI,
@@ -11,6 +11,7 @@ use alloy::{
 };
 use clap::Parser;
 use flate2::{Compression, write::ZlibEncoder};
+use tokio::time::sleep;
 
 use crate::chainio::IForcedInclusionStore::{self, IForcedInclusionStoreErrors};
 
@@ -43,20 +44,31 @@ struct Cli {
 /// Command to execute.
 #[derive(Debug, Parser)]
 enum Cmd {
-    /// Send a forced inclusion transaction.
-    Send(SendCmdOptions),
     /// Read the forced inclusion queue from the contract.
     ReadQueue,
+    /// Send a forced inclusion transaction.
+    Send(SendCmdOptions),
+    /// Send forced inclusion transactions in a loop.
+    Spam(SpamCmdOptions),
 }
 
-#[derive(Debug, Clone, Copy, Parser)]
+/// Options for the send command.
+#[derive(Debug, Clone, Copy, Default, Parser)]
 struct SendCmdOptions {
     /// The nonce delta to use for the forced inclusion transactions.
     ///
     /// This is useful to send multiple forced batches with valid transactions
     /// from the same account.
-    #[clap(long)]
-    starting_nonce_delta: Option<u64>,
+    #[clap(long, default_value_t = 0)]
+    nonce_delta: u64,
+}
+
+/// Options for the spam command.
+#[derive(Debug, Clone, Copy, Default, Parser)]
+struct SpamCmdOptions {
+    /// The interval in seconds between forced inclusion transactions.
+    #[clap(long, default_value_t = 24)]
+    interval_secs: u64,
 }
 
 #[tokio::main]
@@ -66,29 +78,27 @@ async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Send(opts) => cli.send(opts).await,
         Cmd::ReadQueue => cli.read_queue().await,
+        Cmd::Send(opts) => cli.send(opts).await,
+        Cmd::Spam(opts) => cli.spam(opts).await,
     }
 }
 
 impl Cli {
-    async fn send(self, opts: SendCmdOptions) -> eyre::Result<()> {
+    /// Send a forced inclusion transaction.
+    async fn send(&self, opts: SendCmdOptions) -> eyre::Result<()> {
         let l1_provider = ProviderBuilder::new()
-            .wallet(self.l1_private_key)
-            .connect_http(self.l1_rpc_url);
+            .wallet(self.l1_private_key.clone())
+            .connect_http(self.l1_rpc_url.clone());
         let l2_provider = ProviderBuilder::new()
             .wallet(self.l2_private_key.clone())
-            .connect_http(self.l2_rpc_url);
+            .connect_http(self.l2_rpc_url.clone());
 
         let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
 
         let sender = self.l2_private_key.address();
         let current_nonce = l2_provider.get_transaction_count(sender).pending().await?;
-        let starting_nonce = if let Some(delta) = opts.starting_nonce_delta {
-            current_nonce + delta
-        } else {
-            current_nonce
-        };
+        let starting_nonce = current_nonce + opts.nonce_delta;
 
         // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
         let l2_tx_req = TransactionRequest::default()
@@ -175,6 +185,22 @@ impl Cli {
         }
 
         Ok(())
+    }
+
+    /// Send forced inclusion transactions in a loop.
+    async fn spam(self, opts: SpamCmdOptions) -> eyre::Result<()> {
+        let mut send_opts = SendCmdOptions::default();
+
+        loop {
+            println!("Sending forced-inclusion (nonce={})", send_opts.nonce_delta);
+            if let Err(e) = self.send(send_opts).await {
+                eprintln!("Error sednding forced-inclusion transaction: {:?}", e);
+                return Err(e);
+            }
+
+            send_opts.nonce_delta += 1;
+            sleep(Duration::from_secs(opts.interval_secs)).await;
+        }
     }
 }
 
