@@ -11,16 +11,20 @@ use alloy::{
 };
 use clap::Parser;
 use flate2::{Compression, write::ZlibEncoder};
+use futures::StreamExt;
 use tokio::time::sleep;
 
-use crate::chainio::IForcedInclusionStore::{self, IForcedInclusionStoreErrors};
-
 mod blob;
+
 mod chainio;
+use chainio::IForcedInclusionStore::{
+    self, ForcedInclusionConsumed, ForcedInclusionStored, IForcedInclusionStoreErrors,
+};
 
 /// CLI for the forced inclusion tx sender tool.
 #[derive(Debug, Parser)]
 struct Cli {
+    /// The command to execute.
     #[clap(subcommand)]
     command: Cmd,
 
@@ -46,6 +50,8 @@ struct Cli {
 enum Cmd {
     /// Read the forced inclusion queue from the contract.
     ReadQueue,
+    /// Monitor the forced inclusion queue, printing new additions/removals.
+    MonitorQueue,
     /// Send a forced inclusion transaction.
     Send(SendCmdOptions),
     /// Send forced inclusion transactions in a loop.
@@ -79,6 +85,7 @@ async fn main() -> eyre::Result<()> {
 
     match cli.command {
         Cmd::ReadQueue => cli.read_queue().await,
+        Cmd::MonitorQueue => cli.monitor_queue().await,
         Cmd::Send(opts) => cli.send(opts).await,
         Cmd::Spam(opts) => cli.spam(opts).await,
     }
@@ -185,6 +192,36 @@ impl Cli {
         }
 
         Ok(())
+    }
+
+    /// Monitor events in the forced inclusion queue
+    async fn monitor_queue(self) -> eyre::Result<()> {
+        let l1_provider = ProviderBuilder::new().connect_http(self.l1_rpc_url);
+        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
+
+        let stored = store.ForcedInclusionStored_filter().filter;
+        let consumed = store.ForcedInclusionConsumed_filter().filter;
+
+        let mut stored_sub = store.provider().watch_logs(&stored).await?.into_stream();
+        let mut consumed_sub = store.provider().watch_logs(&consumed).await?.into_stream();
+
+        println!("Monitoring forced inclusion queue...");
+        loop {
+            tokio::select! {
+                Some(events) = stored_sub.next() => {
+                    if let Some(event) = events.first() {
+                        let decoded = event.log_decode::<ForcedInclusionStored>()?;
+                        println!("New forced inclusion stored: {:?}", decoded.data().forcedInclusion);
+                    }
+                }
+                Some(consumed_event) = consumed_sub.next() => {
+                    if let Some(event) = consumed_event.first() {
+                        let decoded = event.log_decode::<ForcedInclusionConsumed>()?;
+                        println!("Forced inclusion consumed: {:?}", decoded.data().forcedInclusion);
+                    }
+                }
+            }
+        }
     }
 
     /// Send forced inclusion transactions in a loop.

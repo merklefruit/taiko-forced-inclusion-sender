@@ -1826,6 +1826,7 @@ dependencies = [
  "ethereum-consensus",
  "eyre",
  "flate2",
+ "futures",
  "thiserror 2.0.12",
  "tokio",
 ]

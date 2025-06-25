@@ -21,4 +21,5 @@ dotenvy = "0.15.7"
 eyre = "0.6.12"
 flate2 = "1.1"
 thiserror = "2.0"
+futures = "0.3.31"
 ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus", rev = "ade5ce6" } # Last release in 2022
