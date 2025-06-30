@@ -1,13 +1,14 @@
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use std::{io::Write, time::Duration};
 
 use alloy::{
-    consensus::constants::GWEI_TO_WEI,
+    consensus::{Transaction, constants::GWEI_TO_WEI},
     network::TransactionBuilder,
     primitives::{Address, Bytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::{Provider, ProviderBuilder, WalletProvider},
     rpc::types::TransactionRequest,
-    signers::local::PrivateKeySigner,
-    transports::http::reqwest::Url,
 };
 use clap::Parser;
 use flate2::{Compression, write::ZlibEncoder};
@@ -15,67 +16,19 @@ use futures::StreamExt;
 use tokio::time::sleep;
 
 mod blob;
+use blob::create_blob_sidecar_from_data_async;
+
+mod cli;
+use cli::{Cli, Cmd, SendCmdOptions, SpamCmdOptions};
 
 mod chainio;
-use chainio::IForcedInclusionStore::{
-    self, ForcedInclusionConsumed, ForcedInclusionStored, IForcedInclusionStoreErrors,
+use chainio::{
+    DefaultWalletProvider,
+    IForcedInclusionStore::{
+        self, ForcedInclusionConsumed, ForcedInclusionStored, IForcedInclusionStoreErrors,
+        IForcedInclusionStoreInstance,
+    },
 };
-
-/// CLI for the forced inclusion tx sender tool.
-#[derive(Debug, Parser)]
-struct Cli {
-    /// The command to execute.
-    #[clap(subcommand)]
-    command: Cmd,
-
-    /// RPC URL of the L1 execution layer network.
-    #[clap(long, env)]
-    l1_rpc_url: Url,
-    /// RPC URL of the L2 execution layer network.
-    #[clap(long, env)]
-    l2_rpc_url: Url,
-    /// Private key of the forced inclusion tx signer. Needs to be funded with ETH on L1.
-    #[clap(long, env)]
-    l1_private_key: PrivateKeySigner,
-    /// Private key of the forced inclusion tx signer. Needs to be funded with ETH on L2.
-    #[clap(long, env)]
-    l2_private_key: PrivateKeySigner,
-    /// Address of the forced inclusion store contract on L1.
-    #[clap(long, env)]
-    forced_inclusion_store_address: Address,
-}
-
-/// Command to execute.
-#[derive(Debug, Parser)]
-enum Cmd {
-    /// Read the forced inclusion queue from the contract.
-    ReadQueue,
-    /// Monitor the forced inclusion queue, printing new additions/removals.
-    MonitorQueue,
-    /// Send a forced inclusion transaction.
-    Send(SendCmdOptions),
-    /// Send forced inclusion transactions in a loop.
-    Spam(SpamCmdOptions),
-}
-
-/// Options for the send command.
-#[derive(Debug, Clone, Copy, Default, Parser)]
-struct SendCmdOptions {
-    /// The nonce delta to use for the forced inclusion transactions.
-    ///
-    /// This is useful to send multiple forced batches with valid transactions
-    /// from the same account.
-    #[clap(long, default_value_t = 0)]
-    nonce_delta: u64,
-}
-
-/// Options for the spam command.
-#[derive(Debug, Clone, Copy, Default, Parser)]
-struct SpamCmdOptions {
-    /// The interval in seconds between forced inclusion transactions.
-    #[clap(long, default_value_t = 24)]
-    interval_secs: u64,
-}
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -83,161 +36,168 @@ async fn main() -> eyre::Result<()> {
 
     let cli = Cli::parse();
 
+    let l1 = ProviderBuilder::new()
+        .wallet(cli.l1_private_key)
+        .connect_http(cli.l1_rpc_url);
+    let l2 = ProviderBuilder::new()
+        .wallet(cli.l2_private_key)
+        .connect_http(cli.l2_rpc_url);
+
+    let store = IForcedInclusionStore::new(cli.forced_inclusion_store_address, l1);
+
     match cli.command {
-        Cmd::ReadQueue => cli.read_queue().await,
-        Cmd::MonitorQueue => cli.monitor_queue().await,
-        Cmd::Send(opts) => cli.send(opts).await,
-        Cmd::Spam(opts) => cli.spam(opts).await,
+        Cmd::ReadQueue => read_queue(store).await,
+        Cmd::MonitorQueue => monitor_queue(store).await,
+        Cmd::Send(opts) => send_one(opts, &l2, &store).await,
+        Cmd::Spam(opts) => spam(opts, l2, store).await,
     }
 }
 
-impl Cli {
-    /// Send a forced inclusion transaction.
-    async fn send(&self, opts: SendCmdOptions) -> eyre::Result<()> {
-        let l1_provider = ProviderBuilder::new()
-            .wallet(self.l1_private_key.clone())
-            .connect_http(self.l1_rpc_url.clone());
-        let l2_provider = ProviderBuilder::new()
-            .wallet(self.l2_private_key.clone())
-            .connect_http(self.l2_rpc_url.clone());
+/// Send a forced inclusion transaction.
+async fn send_one(
+    opts: SendCmdOptions,
+    l2: &DefaultWalletProvider,
+    store: &IForcedInclusionStoreInstance<DefaultWalletProvider>,
+) -> eyre::Result<()> {
+    // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
+    let mut l2_tx_req = TransactionRequest::default()
+        .to(Address::ZERO)
+        .value(U256::from(GWEI_TO_WEI));
 
-        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
+    // If a nonce delta is provided, calculate the nonce manually instead of using the
+    // default `CachedNonceManager` value.
+    if opts.nonce_delta > 0 {
+        let sender = l2.wallet().default_signer().address();
+        let pending_nonce = l2.get_transaction_count(sender).pending().await?;
+        l2_tx_req.set_nonce(pending_nonce + opts.nonce_delta);
+    }
 
-        let sender = self.l2_private_key.address();
-        let current_nonce = l2_provider.get_transaction_count(sender).pending().await?;
-        let starting_nonce = current_nonce + opts.nonce_delta;
+    let l2_tx = l2.fill(l2_tx_req).await?.try_into_envelope()?;
+    println!(
+        "🔍 L2 tx to be force-included: nonce={}, hash={}",
+        l2_tx.nonce(),
+        l2_tx.hash()
+    );
 
-        // Generate the L2 transaction to be force-included. Make it a simple transfer of 1 gwei.
-        let l2_tx_req = TransactionRequest::default()
-            .to(Address::ZERO)
-            .with_nonce(starting_nonce)
-            .value(U256::from(GWEI_TO_WEI));
+    // Prepare the sidecar for the forced inclusion
+    let compressed_batch = rlp_encode_and_compress(&vec![l2_tx])?;
+    let byte_size = compressed_batch.len() as u32;
+    let sidecar = create_blob_sidecar_from_data_async(compressed_batch).await?;
 
-        let l2_tx = l2_provider.fill(l2_tx_req).await?.try_into_envelope()?;
-        println!("L2 transasction to be force-included: {:?}", l2_tx.hash());
+    // Get the required fee for the forced inclusion
+    let fee_wei = U256::from(store.feeInGwei().call().await? * GWEI_TO_WEI);
 
-        // Prepare the sidecar for the forced inclusion
-        let compressed_batch = rlp_encode_and_compress(&vec![l2_tx])?;
-        let byte_size = compressed_batch.len() as u32;
-        let sidecar = blob::create_blob_sidecar_from_data_async(compressed_batch).await?;
-
-        // Get the required fee for the forced inclusion
-        let fee_wei = U256::from(store.feeInGwei().call().await? * GWEI_TO_WEI);
-
-        // Send the forced inclusion transaction on L1
-        match store
-            .storeForcedInclusion(0, 0, byte_size)
-            .sidecar(sidecar)
-            .value(fee_wei)
-            .send()
-            .await
-        {
-            Ok(tx) => {
-                let receipt = tx.get_receipt().await?;
-                if receipt.status() {
-                    println!(
-                        "✅ Forced inclusion batch sent successfully! Hash: {}",
-                        receipt.transaction_hash
-                    );
-                } else {
-                    println!(
-                        "❌ Forced inclusion batch failed! Status: {}",
-                        receipt.transaction_hash
-                    );
-                }
-            }
-            Err(e) => {
-                let decoded_error = e
-                    .as_decoded_interface_error::<IForcedInclusionStoreErrors>()
-                    .ok_or(e)?;
+    // Send the forced inclusion transaction on L1
+    match store
+        .storeForcedInclusion(0, 0, byte_size)
+        .sidecar(sidecar)
+        .value(fee_wei)
+        .send()
+        .await
+    {
+        Ok(tx) => {
+            let receipt = tx.get_receipt().await?;
+            if receipt.status() {
                 println!(
-                    "❌ Forced inclusion batch failed! Error: {:?}",
-                    decoded_error
+                    "✅ Forced inclusion batch sent successfully! Hash: {}",
+                    receipt.transaction_hash
+                );
+            } else {
+                println!(
+                    "❌ Forced inclusion batch failed! Status: {}",
+                    receipt.transaction_hash
                 );
             }
         }
-
-        Ok(())
+        Err(e) => {
+            let decoded_error = e
+                .as_decoded_interface_error::<IForcedInclusionStoreErrors>()
+                .ok_or(e)?;
+            println!(
+                "❌ Forced inclusion batch failed! Error: {:?}",
+                decoded_error
+            );
+        }
     }
 
-    /// Read the forced inclusion queue from the contract.
-    async fn read_queue(self) -> eyre::Result<()> {
-        let l1_provider = ProviderBuilder::new()
-            .wallet(self.l1_private_key)
-            .connect_http(self.l1_rpc_url);
-        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
+    Ok(())
+}
 
-        let tail = store.tail().call().await?;
-        let head = store.head().call().await?;
-        let size = tail.saturating_sub(head);
+/// Read the forced inclusion queue from the contract.
+async fn read_queue(
+    store: IForcedInclusionStoreInstance<DefaultWalletProvider>,
+) -> eyre::Result<()> {
+    let tail = store.tail().call().await?;
+    let head = store.head().call().await?;
+    let size = tail.saturating_sub(head);
 
-        if size == 0 {
-            println!("Forced inclusion queue is empty");
-            return Ok(());
-        }
-
-        for i in head..tail {
-            match store.getForcedInclusion(U256::from(i)).call().await {
-                Ok(fi) => println!("Forced inclusion {}: {:?}\n", i, fi),
-                Err(e) => {
-                    if let Some(dec) = e.as_decoded_interface_error::<IForcedInclusionStoreErrors>()
-                    {
-                        println!("Error reading forced inclusion {}: {:?}", i, dec);
-                        continue;
-                    } else {
-                        println!("Error reading forced inclusion {}: {:?}", i, e);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+    if size == 0 {
+        println!("Forced inclusion queue is empty");
+        return Ok(());
     }
 
-    /// Monitor events in the forced inclusion queue
-    async fn monitor_queue(self) -> eyre::Result<()> {
-        let l1_provider = ProviderBuilder::new().connect_http(self.l1_rpc_url);
-        let store = IForcedInclusionStore::new(self.forced_inclusion_store_address, l1_provider);
-
-        let stored = store.ForcedInclusionStored_filter().filter;
-        let consumed = store.ForcedInclusionConsumed_filter().filter;
-
-        let mut stored_sub = store.provider().watch_logs(&stored).await?.into_stream();
-        let mut consumed_sub = store.provider().watch_logs(&consumed).await?.into_stream();
-
-        println!("Monitoring forced inclusion queue...");
-        loop {
-            tokio::select! {
-                Some(events) = stored_sub.next() => {
-                    if let Some(event) = events.first() {
-                        let decoded = event.log_decode::<ForcedInclusionStored>()?;
-                        println!("New forced inclusion stored: {:?}", decoded.data().forcedInclusion);
-                    }
-                }
-                Some(consumed_event) = consumed_sub.next() => {
-                    if let Some(event) = consumed_event.first() {
-                        let decoded = event.log_decode::<ForcedInclusionConsumed>()?;
-                        println!("Forced inclusion consumed: {:?}", decoded.data().forcedInclusion);
-                    }
+    for i in head..tail {
+        match store.getForcedInclusion(U256::from(i)).call().await {
+            Ok(fi) => println!("Forced inclusion {}: {:?}\n", i, fi),
+            Err(e) => {
+                if let Some(dec) = e.as_decoded_interface_error::<IForcedInclusionStoreErrors>() {
+                    println!("Error reading forced inclusion {}: {:?}", i, dec);
+                } else {
+                    println!("Error reading forced inclusion {}: {:?}", i, e);
                 }
             }
         }
     }
 
-    /// Send forced inclusion transactions in a loop.
-    async fn spam(self, opts: SpamCmdOptions) -> eyre::Result<()> {
-        let mut send_opts = SendCmdOptions::default();
+    Ok(())
+}
 
-        loop {
-            println!("Sending forced-inclusion (nonce={})", send_opts.nonce_delta);
-            if let Err(e) = self.send(send_opts).await {
-                eprintln!("Error sednding forced-inclusion transaction: {:?}", e);
-                return Err(e);
+/// Monitor events in the forced inclusion queue
+async fn monitor_queue(
+    store: IForcedInclusionStoreInstance<DefaultWalletProvider>,
+) -> eyre::Result<()> {
+    let stored = store.ForcedInclusionStored_filter().filter;
+    let consumed = store.ForcedInclusionConsumed_filter().filter;
+
+    let mut stored_sub = store.provider().watch_logs(&stored).await?.into_stream();
+    let mut consumed_sub = store.provider().watch_logs(&consumed).await?.into_stream();
+
+    println!("Monitoring forced inclusion queue...");
+    loop {
+        tokio::select! {
+            Some(events) = stored_sub.next() => {
+                if let Some(event) = events.first() {
+                    let decoded = event.log_decode::<ForcedInclusionStored>()?;
+                    println!("New forced inclusion stored: {:?}", decoded.data().forcedInclusion);
+                }
             }
-
-            send_opts.nonce_delta += 1;
-            sleep(Duration::from_secs(opts.interval_secs)).await;
+            Some(consumed_event) = consumed_sub.next() => {
+                if let Some(event) = consumed_event.first() {
+                    let decoded = event.log_decode::<ForcedInclusionConsumed>()?;
+                    println!("Forced inclusion consumed: {:?}", decoded.data().forcedInclusion);
+                }
+            }
         }
+    }
+}
+
+/// Send forced inclusion transactions in a loop.
+async fn spam(
+    opts: SpamCmdOptions,
+    l2: DefaultWalletProvider,
+    store: IForcedInclusionStoreInstance<DefaultWalletProvider>,
+) -> eyre::Result<()> {
+    let send_opts = SendCmdOptions::default();
+
+    loop {
+        // NOTE: by using the default `CachedNonceManager`, the nonce will be incremented
+        // automatically by the provider without making new RPC calls.
+        if let Err(e) = send_one(send_opts, &l2, &store).await {
+            eprintln!("Error sending forced-inclusion: {:?}", e);
+            return Err(e);
+        }
+
+        sleep(Duration::from_secs(opts.interval_secs)).await;
     }
 }
 
