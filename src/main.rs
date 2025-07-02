@@ -32,7 +32,14 @@ use chainio::{
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    dotenvy::dotenv().ok();
+    if let Ok(custom_env_file) = std::env::var("ENV_FILE") {
+        // Try from custom env file, and abort if it fails
+        dotenvy::from_filename(custom_env_file)?;
+    } else {
+        // Try from default .env file, and ignore if it fails. It might
+        // be that the user isn't using it.
+        dotenvy::dotenv().ok();
+    }
 
     let cli = Cli::parse();
 
@@ -113,10 +120,8 @@ async fn send_one(
             let decoded_error = e
                 .as_decoded_interface_error::<IForcedInclusionStoreErrors>()
                 .ok_or(e)?;
-            println!(
-                "❌ Forced inclusion batch failed! Error: {:?}",
-                decoded_error
-            );
+
+            println!("❌ Forced inclusion batch failed! Error: {decoded_error:?}",);
         }
     }
 
@@ -138,12 +143,12 @@ async fn read_queue(
 
     for i in head..tail {
         match store.getForcedInclusion(U256::from(i)).call().await {
-            Ok(fi) => println!("Forced inclusion {}: {:?}\n", i, fi),
+            Ok(fi) => println!("Forced inclusion {i}: {fi:?}\n"),
             Err(e) => {
                 if let Some(dec) = e.as_decoded_interface_error::<IForcedInclusionStoreErrors>() {
-                    println!("Error reading forced inclusion {}: {:?}", i, dec);
+                    println!("Error reading forced inclusion {i}: {dec:?}");
                 } else {
-                    println!("Error reading forced inclusion {}: {:?}", i, e);
+                    println!("Error reading forced inclusion {i}: {e:?}");
                 }
             }
         }
@@ -193,7 +198,7 @@ async fn spam(
         // NOTE: by using the default `CachedNonceManager`, the nonce will be incremented
         // automatically by the provider without making new RPC calls.
         if let Err(e) = send_one(send_opts, &l2, &store).await {
-            eprintln!("Error sending forced-inclusion: {:?}", e);
+            eprintln!("Error sending forced-inclusion: {e:?}");
             return Err(e);
         }
 
